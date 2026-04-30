@@ -1,0 +1,52 @@
+:root {
+    --primary: #355F43;
+    --font-color-w: #ffffff;
+}
+
+* {
+    padding: 0;
+    margin: 0;
+    box-sizing: border-box;
+}
+
+@font-face {
+    font-family: 'Inter';
+    src: url('/inter/Inter_24pt-Regular.ttf') format('truetype');
+    font-weight: normal;
+    font-style: normal;
+}
+
+body {
+    font-family: Inter;
+}
+
+nav {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    background-color: var(--primary);
+    color: var(--font-color-w);
+    padding: 1.5rem;
+}
+
+nav h4 {
+    font-size: 1.6rem;
+}
+nav p {
+    font-size: 0.8rem;
+}
+
+body {
+    font-family: Arial, sans-serif;
+    margin: 0;
+    background: #f5f5f5;
+}
+
+nav {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 7px 20px;
+    background: var(--primary);
+    color: white;
+}

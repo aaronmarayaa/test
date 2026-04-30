@@ -1,0 +1,26 @@
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::table('schedule_generation_runs', function (Blueprint $table) {
+            if (Schema::hasColumn('schedule_generation_runs', 'notes')) {
+                $table->dropColumn('notes');
+            }
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::table('schedule_generation_runs', function (Blueprint $table) {
+            if (!Schema::hasColumn('schedule_generation_runs', 'notes')) {
+                $table->text('notes')->nullable()->after('total_failed');
+            }
+        });
+    }
+};
