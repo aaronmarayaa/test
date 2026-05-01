@@ -28,6 +28,14 @@ class SubjectController extends Controller
             $query->where('room_type_required', $request->room_type_required);
         }
 
+        if ($request->filled('lecture_room_category_required')) {
+            $query->where('lecture_room_category_required', $request->lecture_room_category_required);
+        }
+
+        if ($request->filled('laboratory_room_category_required')) {
+            $query->where('laboratory_room_category_required', $request->laboratory_room_category_required);
+        }
+
         $subjects = $query->orderBy('id')->get();
 
         return response()->json([
@@ -48,23 +56,7 @@ class SubjectController extends Controller
 
     public function store(Request $request)
     {
-        $validated = $request->validate([
-            'subject_code' => ['required', 'string', 'max:50', Rule::unique('subjects')->where(fn ($query) => $query->where('subject_name', $request->subject_name))],
-            'subject_name' => 'required|string|max:255',
-            'units' => 'required|numeric|min:0|max:99.9',
-            'total_hours_per_week' => 'required|numeric|min:0|max:99.99',
-            'lecture_hours' => 'required|numeric|min:0|max:99.99',
-            'laboratory_hours' => 'required|numeric|min:0|max:99.99',
-            'allow_split_sessions' => 'required|boolean',
-            'break_minutes_per_week' => 'required|integer|min:0',
-            'preferred_session_count' => 'required|integer|min:1',
-            'max_hours_per_day' => 'required|numeric|min:0|max:99.99',
-            'room_type_required' => 'required|string|max:50',
-            'lecture_room_type_required' => 'nullable|string|max:50',
-            'laboratory_room_type_required' => 'nullable|string|max:50',
-            'subject_category' => 'required|string|max:50',
-            'archived' => 'required|boolean',
-        ]);
+        $validated = $request->validate($this->rules($request));
 
         $subject = Subject::create($validated);
 
@@ -78,8 +70,26 @@ class SubjectController extends Controller
     {
         $subject = Subject::findOrFail($id);
 
-        $validated = $request->validate([
-            'subject_code' => ['required', 'string', 'max:50', Rule::unique('subjects')->where(fn ($query) => $query->where('subject_name', $request->subject_name))->ignore($subject->id)],
+        $validated = $request->validate($this->rules($request, $subject->id));
+
+        $subject->update($validated);
+
+        return response()->json([
+            'message' => 'Subject updated successfully.',
+            'data' => $subject
+        ], 200);
+    }
+
+    protected function rules(Request $request, ?int $ignoreId = null): array
+    {
+        $uniqueRule = Rule::unique('subjects')->where(fn ($query) => $query->where('subject_name', $request->subject_name));
+
+        if ($ignoreId) {
+            $uniqueRule->ignore($ignoreId);
+        }
+
+        return [
+            'subject_code' => ['required', 'string', 'max:50', $uniqueRule],
             'subject_name' => 'required|string|max:255',
             'units' => 'required|numeric|min:0|max:99.9',
             'total_hours_per_week' => 'required|numeric|min:0|max:99.99',
@@ -91,17 +101,12 @@ class SubjectController extends Controller
             'max_hours_per_day' => 'required|numeric|min:0|max:99.99',
             'room_type_required' => 'required|string|max:50',
             'lecture_room_type_required' => 'nullable|string|max:50',
+            'lecture_room_category_required' => 'nullable|string|max:80',
             'laboratory_room_type_required' => 'nullable|string|max:50',
+            'laboratory_room_category_required' => 'nullable|string|max:80',
             'subject_category' => 'required|string|max:50',
             'archived' => 'required|boolean',
-        ]);
-
-        $subject->update($validated);
-
-        return response()->json([
-            'message' => 'Subject updated successfully.',
-            'data' => $subject
-        ], 200);
+        ];
     }
 
     public function destroy($id)

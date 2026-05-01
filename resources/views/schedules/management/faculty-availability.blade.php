@@ -10,7 +10,7 @@
 
     <input type="hidden" id="edit-id">
 
-    <div class="notice">Select an instructor first to see the proper availability rule.</div>
+    <div class="notice">Select an instructor first to set or edit their availability.</div>
 
     <div class="form-group">
         <label for="instructor_id">Instructor</label>
@@ -76,30 +76,128 @@
 @endsection
 
 @section('list')
-    <h2>Availability List</h2>
+    <h2>Faculty Availability List</h2>
 
     <table class="list-table">
         <thead>
             <tr>
-                <th>ID</th>
                 <th>Instructor</th>
                 <th>Type</th>
-                <th>School Year</th>
-                <th>Semester</th>
-                <th>Day</th>
-                <th>Start</th>
-                <th>End</th>
-                <th>Status</th>
-                <th>Notes</th>
+                <th>Total Slots</th>
+                <th>Available</th>
+                <th>Unavailable</th>
+                <th>School Year / Semester</th>
+                <th>Quick View</th>
                 <th>Actions</th>
             </tr>
         </thead>
         <tbody id="faculty-availability-table-body">
             <tr>
-                <td colspan="11">Loading...</td>
+                <td colspan="8">Loading...</td>
             </tr>
         </tbody>
     </table>
+
+    <div id="availability-modal" class="modal-backdrop" style="display:none;">
+        <div class="modal-card">
+            <div class="modal-header">
+                <div>
+                    <h3 id="modal-title">Faculty Availability</h3>
+                    <p id="modal-subtitle"></p>
+                </div>
+                <button type="button" class="btn-edit" id="close-modal-btn">Close</button>
+            </div>
+
+            <div class="modal-table-wrap">
+                <table class="list-table">
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>School Year</th>
+                            <th>Semester</th>
+                            <th>Day</th>
+                            <th>Start</th>
+                            <th>End</th>
+                            <th>Status</th>
+                            <th>Notes</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="modal-availability-body">
+                        <tr>
+                            <td colspan="9">No rows found.</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <style>
+        .modal-backdrop {
+            position: fixed;
+            inset: 0;
+            z-index: 9999;
+            background: rgba(15, 23, 42, 0.55);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+        }
+
+        .modal-card {
+            width: min(1100px, 96vw);
+            max-height: 88vh;
+            overflow: auto;
+            background: #fff;
+            border-radius: 18px;
+            box-shadow: 0 24px 70px rgba(15, 23, 42, 0.28);
+            padding: 22px;
+        }
+
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            gap: 16px;
+            align-items: flex-start;
+            margin-bottom: 16px;
+        }
+
+        .modal-header h3 {
+            margin: 0 0 4px;
+        }
+
+        .modal-header p {
+            margin: 0;
+            color: #64748b;
+        }
+
+        .modal-table-wrap {
+            overflow-x: auto;
+        }
+
+        .quick-days {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+        }
+
+        .quick-day-pill {
+            display: inline-flex;
+            align-items: center;
+            border-radius: 999px;
+            padding: 4px 9px;
+            background: #f1f5f9;
+            font-size: 12px;
+            color: #334155;
+            white-space: nowrap;
+        }
+
+        .row-muted {
+            color: #64748b;
+            font-size: 13px;
+        }
+    </style>
 
     <script>
         const facultyAvailabilityApiUrl = "/api/faculty-availabilities";
@@ -122,10 +220,26 @@
 
         const saveBtn = document.getElementById("save-btn");
         const cancelBtn = document.getElementById("cancel-btn");
+        const modal = document.getElementById("availability-modal");
+        const modalTitle = document.getElementById("modal-title");
+        const modalSubtitle = document.getElementById("modal-subtitle");
+        const modalBody = document.getElementById("modal-availability-body");
+        const closeModalBtn = document.getElementById("close-modal-btn");
 
         let instructorsMap = {};
         let schoolYearsMap = {};
         let semestersMap = {};
+        let allAvailabilityRows = [];
+
+        const dayOrder = {
+            Monday: 1,
+            Tuesday: 2,
+            Wednesday: 3,
+            Thursday: 4,
+            Friday: 5,
+            Saturday: 6,
+            Sunday: 7
+        };
 
         function escapeHtml(value) {
             return String(value ?? "")
@@ -139,6 +253,18 @@
         function normalizeTimeForInput(value) {
             if (!value) return "";
             return String(value).slice(0, 5);
+        }
+
+        function instructorLabel(instructor) {
+            return instructor.instructor_name || instructor.name || `Instructor #${instructor.id}`;
+        }
+
+        function getSchoolYear(item) {
+            return item.school_year || item.schoolYear || schoolYearsMap[item.school_year_id] || {};
+        }
+
+        function getSemester(item) {
+            return item.semester || semestersMap[item.semester_id] || {};
         }
 
         function resetForm() {
@@ -157,56 +283,152 @@
             cancelBtn.style.display = "none";
         }
 
-        async function loadDropdown(url, selectEl, mapStore, labelBuilder) {
-            try {
-                const response = await fetch(url, {
-                    headers: { "Accept": "application/json" }
-                });
+        async function fetchApi(url, fallbackMessage) {
+            const response = await fetch(url, {
+                headers: { "Accept": "application/json" }
+            });
 
-                const result = await response.json();
+            const result = await response.json();
 
-                if (!response.ok) {
-                    throw new Error(result.message || "Failed to load dropdown data.");
-                }
-
-                const items = Array.isArray(result) ? result : (result.data || []);;
-                Object.keys(mapStore).forEach(key => delete mapStore[key]);
-
-                items.forEach(item => {
-                    mapStore[item.id] = item;
-                });
-
-                selectEl.innerHTML = `
-                    <option value="">Select option</option>
-                    ${items.map(item => `
-                        <option value="${item.id}">${labelBuilder(item)}</option>
-                    `).join("")}
-                `;
-            } catch (error) {
-                selectEl.innerHTML = `<option value="">${escapeHtml(error.message)}</option>`;
+            if (!response.ok) {
+                throw new Error(result.message || fallbackMessage);
             }
+
+            return Array.isArray(result) ? result : (result.data || []);
         }
 
-        function renderRows(items) {
-            if (!Array.isArray(items) || items.length === 0) {
-                tableBody.innerHTML = `<tr><td colspan="11">No availability rows found.</td></tr>`;
+        async function loadDropdown(url, selectEl, mapStore, labelBuilder, fallbackMessage) {
+            const items = await fetchApi(url, fallbackMessage);
+
+            Object.keys(mapStore).forEach(key => delete mapStore[key]);
+            items.forEach(item => {
+                mapStore[item.id] = item;
+            });
+
+            selectEl.innerHTML = `
+                <option value="">Select option</option>
+                ${items.map(item => `
+                    <option value="${escapeHtml(item.id)}">${escapeHtml(labelBuilder(item))}</option>
+                `).join("")}
+            `;
+        }
+
+        function groupByInstructor(items) {
+            const grouped = {};
+
+            items.forEach(item => {
+                const instructorId = String(item.instructor_id || "");
+                if (!instructorId) return;
+
+                if (!grouped[instructorId]) {
+                    grouped[instructorId] = [];
+                }
+
+                grouped[instructorId].push(item);
+            });
+
+            return Object.entries(grouped).map(([instructorId, rows]) => {
+                const first = rows[0] || {};
+                const instructor = first.instructor || instructorsMap[instructorId] || { id: instructorId };
+
+                rows.sort((a, b) => {
+                    const dayDiff = (dayOrder[a.day] || 99) - (dayOrder[b.day] || 99);
+                    if (dayDiff !== 0) return dayDiff;
+                    return String(a.start_time || "").localeCompare(String(b.start_time || ""));
+                });
+
+                return {
+                    instructorId,
+                    instructor,
+                    rows,
+                    total: rows.length,
+                    available: rows.filter(row => row.status === "Available").length,
+                    unavailable: rows.filter(row => row.status === "Unavailable").length
+                };
+            }).sort((a, b) => instructorLabel(a.instructor).localeCompare(instructorLabel(b.instructor)));
+        }
+
+        function buildSchoolYearSemesterSummary(rows) {
+            const labels = new Set();
+
+            rows.forEach(row => {
+                const schoolYear = getSchoolYear(row);
+                const semester = getSemester(row);
+                const syLabel = schoolYear.school_year || "No school year";
+                const semLabel = semester.semester_name || "No semester";
+                labels.add(`${syLabel} / ${semLabel}`);
+            });
+
+            return Array.from(labels).join("<br>");
+        }
+
+        function buildQuickView(rows) {
+            const availableRows = rows.filter(row => row.status === "Available");
+            const displayRows = availableRows.length ? availableRows : rows;
+
+            const quickRows = displayRows.slice(0, 5).map(row => `
+                <span class="quick-day-pill">
+                    ${escapeHtml(row.day)} ${escapeHtml(normalizeTimeForInput(row.start_time))}-${escapeHtml(normalizeTimeForInput(row.end_time))}
+                </span>
+            `).join("");
+
+            const moreCount = Math.max(displayRows.length - 5, 0);
+
+            return `
+                <div class="quick-days">
+                    ${quickRows || '<span class="row-muted">No slots</span>'}
+                    ${moreCount > 0 ? `<span class="quick-day-pill">+${moreCount} more</span>` : ""}
+                </div>
+            `;
+        }
+
+        function renderGroupedRows(items) {
+            const groups = groupByInstructor(items);
+
+            if (groups.length === 0) {
+                tableBody.innerHTML = `<tr><td colspan="8">No availability rows found.</td></tr>`;
                 return;
             }
 
-            tableBody.innerHTML = items.map(item => {
-                const instructor = item.instructor || instructorsMap[item.instructor_id] || {};
-                const schoolYear = item.school_year || item.schoolYear || schoolYearsMap[item.school_year_id] || {};
-                const semester = item.semester || semestersMap[item.semester_id] || {};
+            tableBody.innerHTML = groups.map(group => {
+                const employmentType = group.instructor.employment_type || "";
+
+                return `
+                    <tr>
+                        <td>${escapeHtml(instructorLabel({ id: group.instructorId, ...group.instructor }))}</td>
+                        <td>
+                            <span class="tag ${employmentType === 'part_time' ? 'tag-yellow' : 'tag-green'}">
+                                ${escapeHtml(employmentType || "N/A")}
+                            </span>
+                        </td>
+                        <td>${escapeHtml(group.total)}</td>
+                        <td><span class="tag tag-green">${escapeHtml(group.available)}</span></td>
+                        <td><span class="tag tag-gray">${escapeHtml(group.unavailable)}</span></td>
+                        <td>${buildSchoolYearSemesterSummary(group.rows)}</td>
+                        <td>${buildQuickView(group.rows)}</td>
+                        <td>
+                            <button type="button" class="btn-edit" data-action="view" data-instructor-id="${escapeHtml(group.instructorId)}">
+                                View Availability
+                            </button>
+                        </td>
+                    </tr>
+                `;
+            }).join("");
+        }
+
+        function renderModalRows(rows) {
+            if (!Array.isArray(rows) || rows.length === 0) {
+                modalBody.innerHTML = `<tr><td colspan="9">No availability rows found.</td></tr>`;
+                return;
+            }
+
+            modalBody.innerHTML = rows.map(item => {
+                const schoolYear = getSchoolYear(item);
+                const semester = getSemester(item);
 
                 return `
                     <tr>
                         <td>${escapeHtml(item.id)}</td>
-                        <td>${escapeHtml(instructor.instructor_name || "")}</td>
-                        <td>
-                            <span class="tag ${instructor.employment_type === 'part_time' ? 'tag-yellow' : 'tag-green'}">
-                                ${escapeHtml(instructor.employment_type || "")}
-                            </span>
-                        </td>
                         <td>${escapeHtml(schoolYear.school_year || "")}</td>
                         <td>${escapeHtml(semester.semester_name || "")}</td>
                         <td>${escapeHtml(item.day)}</td>
@@ -220,8 +442,8 @@
                         <td>${escapeHtml(item.notes || "")}</td>
                         <td>
                             <div class="actions">
-                                <button type="button" class="btn-edit" onclick='editItem(${JSON.stringify(item)})'>Edit</button>
-                                <button type="button" class="btn-delete" onclick="deleteItem(${item.id})">Delete</button>
+                                <button type="button" class="btn-edit" data-action="edit" data-id="${escapeHtml(item.id)}">Edit</button>
+                                <button type="button" class="btn-delete" data-action="delete" data-id="${escapeHtml(item.id)}">Delete</button>
                             </div>
                         </td>
                     </tr>
@@ -229,23 +451,35 @@
             }).join("");
         }
 
-        async function loadFacultyAvailabilities() {
-            tableBody.innerHTML = `<tr><td colspan="11">Loading...</td></tr>`;
-
-            try {
-                const response = await fetch(facultyAvailabilityApiUrl, {
-                    headers: { "Accept": "application/json" }
+        function openAvailabilityModal(instructorId) {
+            const rows = allAvailabilityRows
+                .filter(row => String(row.instructor_id) === String(instructorId))
+                .sort((a, b) => {
+                    const dayDiff = (dayOrder[a.day] || 99) - (dayOrder[b.day] || 99);
+                    if (dayDiff !== 0) return dayDiff;
+                    return String(a.start_time || "").localeCompare(String(b.start_time || ""));
                 });
 
-                const result = await response.json();
+            const instructor = rows[0]?.instructor || instructorsMap[instructorId] || { id: instructorId };
 
-                if (!response.ok) {
-                    throw new Error(result.message || "Failed to load faculty availabilities.");
-                }
+            modalTitle.textContent = instructorLabel({ id: instructorId, ...instructor });
+            modalSubtitle.textContent = `${rows.length} availability slot${rows.length === 1 ? "" : "s"}`;
+            renderModalRows(rows);
+            modal.style.display = "flex";
+        }
 
-                renderRows(result.data || []);
+        function closeAvailabilityModal() {
+            modal.style.display = "none";
+        }
+
+        async function loadFacultyAvailabilities() {
+            tableBody.innerHTML = `<tr><td colspan="8">Loading...</td></tr>`;
+
+            try {
+                allAvailabilityRows = await fetchApi(facultyAvailabilityApiUrl, "Failed to load faculty availabilities.");
+                renderGroupedRows(allAvailabilityRows);
             } catch (error) {
-                tableBody.innerHTML = `<tr><td colspan="11">${escapeHtml(error.message)}</td></tr>`;
+                tableBody.innerHTML = `<tr><td colspan="8">${escapeHtml(error.message)}</td></tr>`;
             }
         }
 
@@ -263,7 +497,7 @@
             formTitle.textContent = "Edit Availability";
             saveBtn.textContent = "Update Availability";
             cancelBtn.style.display = "inline-block";
-
+            closeAvailabilityModal();
             window.scrollTo({ top: 0, behavior: "smooth" });
         }
 
@@ -278,11 +512,16 @@
                 start_time: startTimeInput.value,
                 end_time: endTimeInput.value,
                 status: statusInput.value,
-                notes: notesInput.value.trim() || null
+                notes: notesInput.value
             };
 
-            if (!payload.instructor_id || !payload.school_year_id || !payload.semester_id || !payload.day || !payload.start_time || !payload.end_time || !payload.status) {
-                alert("Instructor, School Year, Semester, Day, Start Time, End Time, and Availability are required.");
+            if (!payload.instructor_id || !payload.school_year_id || !payload.semester_id || !payload.day || !payload.start_time || !payload.end_time) {
+                alert("Instructor, school year, semester, day, start time, and end time are required.");
+                return;
+            }
+
+            if (payload.start_time >= payload.end_time) {
+                alert("End time must be later than start time.");
                 return;
             }
 
@@ -307,6 +546,7 @@
                         const firstError = Object.values(result.errors).flat()[0];
                         throw new Error(firstError || "Validation failed.");
                     }
+
                     throw new Error(result.message || "Save failed.");
                 }
 
@@ -338,6 +578,7 @@
                 }
 
                 await loadFacultyAvailabilities();
+                closeAvailabilityModal();
                 alert(result.message || "Deleted successfully.");
             } catch (error) {
                 alert(error.message);
@@ -346,30 +587,74 @@
 
         saveBtn.addEventListener("click", saveItem);
         cancelBtn.addEventListener("click", resetForm);
+        closeModalBtn.addEventListener("click", closeAvailabilityModal);
+
+        modal.addEventListener("click", event => {
+            if (event.target === modal) {
+                closeAvailabilityModal();
+            }
+        });
+
+        tableBody.addEventListener("click", event => {
+            const button = event.target.closest("button[data-action]");
+            if (!button) return;
+
+            if (button.dataset.action === "view") {
+                openAvailabilityModal(button.dataset.instructorId);
+            }
+        });
+
+        modalBody.addEventListener("click", event => {
+            const button = event.target.closest("button[data-action]");
+            if (!button) return;
+
+            const id = button.dataset.id;
+            const item = allAvailabilityRows.find(row => String(row.id) === String(id));
+
+            if (button.dataset.action === "edit") {
+                if (!item) {
+                    alert("Availability row not found.");
+                    return;
+                }
+
+                editItem(item);
+            }
+
+            if (button.dataset.action === "delete") {
+                deleteItem(id);
+            }
+        });
 
         async function initPage() {
-            await loadDropdown(
-                instructorsApiUrl,
-                instructorIdInput,
-                instructorsMap,
-                item => `${escapeHtml(item.instructor_name)}`
-            );
+            try {
+                await Promise.all([
+                    loadDropdown(
+                        instructorsApiUrl,
+                        instructorIdInput,
+                        instructorsMap,
+                        item => instructorLabel(item),
+                        "Failed to load instructors."
+                    ),
+                    loadDropdown(
+                        schoolYearsApiUrl,
+                        schoolYearIdInput,
+                        schoolYearsMap,
+                        item => item.school_year || `School Year #${item.id}`,
+                        "Failed to load school years."
+                    ),
+                    loadDropdown(
+                        semestersApiUrl,
+                        semesterIdInput,
+                        semestersMap,
+                        item => item.semester_name || `Semester #${item.id}`,
+                        "Failed to load semesters."
+                    )
+                ]);
 
-            await loadDropdown(
-                schoolYearsApiUrl,
-                schoolYearIdInput,
-                schoolYearsMap,
-                item => `${escapeHtml(item.school_year)}`
-            );
-
-            await loadDropdown(
-                semestersApiUrl,
-                semesterIdInput,
-                semestersMap,
-                item => `${escapeHtml(item.semester_name)}`
-            );
-
-            await loadFacultyAvailabilities();
+                await loadFacultyAvailabilities();
+            } catch (error) {
+                tableBody.innerHTML = `<tr><td colspan="8">${escapeHtml(error.message)}</td></tr>`;
+            }
         }
 
         initPage();

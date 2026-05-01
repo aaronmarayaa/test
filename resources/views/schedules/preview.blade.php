@@ -551,9 +551,8 @@
                                     <div class="subject-type">{{ $subjectType }}</div>
                                     <div class="teacher">{{ $item->instructor->instructor_name }}</div>
                                     <div class="room">
-                                        {{ $item->room->room_code }}
                                         @if(!empty($item->room->room_name))
-                                            / {{ $item->room->room_name }}
+                                            {{ $item->room->room_name }}
                                         @endif
                                     </div>
                                     <div class="time-range">

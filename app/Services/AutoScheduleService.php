@@ -140,21 +140,10 @@ class AutoScheduleService
                 $subject = $curriculum->subject;
                 $sessions = $this->buildSessions($subject);
 
-                $instructorCandidates = FacultySubject::with('instructor')
-                    ->where('subject_id', $subject->id)
-                    ->whereHas('instructor', function ($query) {
-                        $query->where(function ($q) {
-                            $q->whereNull('archived')
-                                ->orWhere('archived', 0);
-                        })
-                        ->where(function ($q) {
-                            $q->whereNull('status')
-                                ->orWhereIn('status', ['Active', 'active']);
-                        });
-                    })
-                    ->orderByDesc('is_primary')
-                    ->orderByDesc('priority_score')
-                    ->get();
+                $instructorCandidates = $this->getInstructorCandidatesForSubjectCourse(
+                    $subject->id,
+                    $section->course_id
+                );
 
                 // Load balancing improvement:
                 // Only instructors assigned in faculty_subjects are considered.
@@ -167,7 +156,8 @@ class AutoScheduleService
                 );
 
                 if ($instructorCandidates->isEmpty()) {
-                    $reason = 'No instructor assigned to this subject.';
+                    $courseLabel = $section->course->course_code ?? 'this course';
+                    $reason = "No instructor assigned to this subject for {$courseLabel}.";
 
                     $failed[] = [
                         'subject' => $subject->subject_code,
@@ -203,110 +193,179 @@ class AutoScheduleService
                     $pairedTimeFailureReasons = [];
                     $pairedRoomFailureReasons = [];
 
-                    foreach ($instructorCandidates as $facultySubject) {
-                        $instructor = $facultySubject->instructor;
+                    // Lecture and laboratory can have different instructors.
+                    // Example: NCM101 Lec = Michelle, NCM101 Lab = Dr. Efreim.
+                    $lectureInstructorCandidates = $this->sortInstructorCandidatesByLoadBalance(
+                        $this->getInstructorCandidatesForSubjectCourse(
+                            (int) $subject->id,
+                            (int) $section->course_id,
+                            'lecture'
+                        ),
+                        $schoolYearId,
+                        $semesterId
+                    );
 
-                        $pairedSlots = $this->findConsecutiveLectureLabSlot(
-                            $section,
-                            $subject,
-                            $instructor->id,
-                            $schoolYearId,
-                            $semesterId,
-                            $sessions
-                        );
+                    $labInstructorCandidates = $this->sortInstructorCandidatesByLoadBalance(
+                        $this->getInstructorCandidatesForSubjectCourse(
+                            (int) $subject->id,
+                            (int) $section->course_id,
+                            'laboratory'
+                        ),
+                        $schoolYearId,
+                        $semesterId
+                    );
 
-                        if (!$pairedSlots) {
-                            $pairedTimeFailureReasons = array_merge(
-                                $pairedTimeFailureReasons,
-                                $this->getLastSlotFailureReasons()
-                            );
+                    if ($lectureInstructorCandidates->isEmpty() || $labInstructorCandidates->isEmpty()) {
+                        $missing = [];
+
+                        if ($lectureInstructorCandidates->isEmpty()) {
+                            $missing[] = 'lecture instructor';
+                        }
+
+                        if ($labInstructorCandidates->isEmpty()) {
+                            $missing[] = 'laboratory instructor';
+                        }
+
+                        $reason = 'No assigned ' . implode(' and ', $missing) . ' for this curriculum subject and course.';
+
+                        $failed[] = [
+                            'subject' => $subject->subject_code,
+                            'reason' => $reason,
+                        ];
+
+                        ScheduleGenerationConflict::create([
+                            'generation_run_id' => $generationRun->id,
+                            'schedule_id' => null,
+                            'subject_id' => $subject->id,
+                            'instructor_id' => null,
+                            'room_id' => null,
+                            'conflict_type' => 'NO_SESSION_TYPE_INSTRUCTOR',
+                            'severity' => 'error',
+                            'is_conflict' => true,
+                            'message' => "{$subject->subject_code} - {$reason}",
+                        ]);
+
+                        continue;
+                    }
+
+                    foreach ($lectureInstructorCandidates as $lectureFacultySubject) {
+                        $lectureInstructor = $lectureFacultySubject->instructor;
+
+                        if (!$lectureInstructor) {
                             continue;
                         }
 
-                        $pairedFoundTime = true;
+                        foreach ($labInstructorCandidates as $labFacultySubject) {
+                            $labInstructor = $labFacultySubject->instructor;
 
-                        $roomAssignments = [];
-                        $canUseRooms = true;
+                            if (!$labInstructor) {
+                                continue;
+                            }
 
-                        foreach ($pairedSlots as $slotData) {
-                            $roomType = $this->getRoomTypeForSession($subject, $slotData['type']);
-
-                            $room = $this->findAvailableRoom(
-                                $roomType,
-                                (int) $section->capacity,
+                            $pairedSlots = $this->findConsecutiveLectureLabSlot(
+                                $section,
+                                $subject,
+                                $lectureInstructor->id,
+                                $labInstructor->id,
                                 $schoolYearId,
                                 $semesterId,
-                                $slotData['day'],
-                                $slotData['start_time'],
-                                $slotData['end_time']
+                                $sessions
                             );
 
-                            if (!$room) {
-                                $pairedRoomFailureReasons[] = $this->describeRoomFailure(
+                            if (!$pairedSlots) {
+                                $pairedTimeFailureReasons = array_merge(
+                                    $pairedTimeFailureReasons,
+                                    $this->getLastSlotFailureReasons()
+                                );
+                                continue;
+                            }
+
+                            $pairedFoundTime = true;
+
+                            $roomAssignments = [];
+                            $canUseRooms = true;
+
+                            foreach ($pairedSlots as $slotData) {
+                                $roomType = $this->getRoomTypeForSession($subject, $slotData['type']);
+
+                                $room = $this->findAvailableRoom(
                                     $roomType,
                                     (int) $section->capacity,
                                     $schoolYearId,
                                     $semesterId,
                                     $slotData['day'],
                                     $slotData['start_time'],
-                                    $slotData['end_time'],
-                                    $slotData['type']
+                                    $slotData['end_time']
                                 );
-                                $canUseRooms = false;
-                                break;
+
+                                if (!$room) {
+                                    $pairedRoomFailureReasons[] = $this->describeRoomFailure(
+                                        $roomType,
+                                        (int) $section->capacity,
+                                        $schoolYearId,
+                                        $semesterId,
+                                        $slotData['day'],
+                                        $slotData['start_time'],
+                                        $slotData['end_time'],
+                                        $slotData['type']
+                                    );
+                                    $canUseRooms = false;
+                                    break;
+                                }
+
+                                $roomAssignments[] = [
+                                    'slot' => $slotData,
+                                    'room' => $room,
+                                ];
                             }
 
-                            $roomAssignments[] = [
-                                'slot' => $slotData,
-                                'room' => $room,
-                            ];
+                            if (!$canUseRooms) {
+                                continue;
+                            }
+
+                            $pairedFoundRoom = true;
+
+                            foreach ($roomAssignments as $assignment) {
+                                $slotData = $assignment['slot'];
+                                $room = $assignment['room'];
+                                $slotInstructorId = (int) $slotData['instructor_id'];
+
+                                $schedule = Schedule::create([
+                                    'generation_run_id' => $generationRun->id,
+                                    'school_year_id' => $schoolYearId,
+                                    'semester_id' => $semesterId,
+                                    'section_id' => $section->id,
+                                    'course_id' => $section->course_id,
+                                    'subject_id' => $subject->id,
+                                    'instructor_id' => $slotInstructorId,
+                                    'room_id' => $room->id,
+                                    'year_level' => $section->year_level,
+                                    'day' => $slotData['day'],
+                                    'start_time' => $slotData['start_time'],
+                                    'end_time' => $slotData['end_time'],
+                                    'hours' => $slotData['hours'],
+                                    'session_type' => $slotData['type'],
+                                    'status' => 'Scheduled',
+                                ]);
+
+                                ScheduleGenerationConflict::create([
+                                    'generation_run_id' => $generationRun->id,
+                                    'schedule_id' => $schedule->id,
+                                    'subject_id' => $subject->id,
+                                    'instructor_id' => $slotInstructorId,
+                                    'room_id' => $room->id,
+                                    'conflict_type' => 'SCHEDULED_SUCCESS',
+                                    'severity' => 'info',
+                                    'is_conflict' => false,
+                                    'message' => "{$subject->subject_code} {$slotData['type']} scheduled on {$slotData['day']} {$slotData['start_time']} - {$slotData['end_time']} in room {$room->room_code}.",
+                                ]);
+
+                                $created[] = $schedule->load(['subject', 'instructor', 'room']);
+                            }
+
+                            $pairedPlaced = true;
+                            break 2;
                         }
-
-                        if (!$canUseRooms) {
-                            continue;
-                        }
-
-                        $pairedFoundRoom = true;
-
-                        foreach ($roomAssignments as $assignment) {
-                            $slotData = $assignment['slot'];
-                            $room = $assignment['room'];
-
-                            $schedule = Schedule::create([
-                                'generation_run_id' => $generationRun->id,
-                                'school_year_id' => $schoolYearId,
-                                'semester_id' => $semesterId,
-                                'section_id' => $section->id,
-                                'course_id' => $section->course_id,
-                                'subject_id' => $subject->id,
-                                'instructor_id' => $instructor->id,
-                                'room_id' => $room->id,
-                                'year_level' => $section->year_level,
-                                'day' => $slotData['day'],
-                                'start_time' => $slotData['start_time'],
-                                'end_time' => $slotData['end_time'],
-                                'hours' => $slotData['hours'],
-                                'session_type' => $slotData['type'],
-                                'status' => 'Scheduled',
-                            ]);
-
-                            ScheduleGenerationConflict::create([
-                                'generation_run_id' => $generationRun->id,
-                                'schedule_id' => $schedule->id,
-                                'subject_id' => $subject->id,
-                                'instructor_id' => $instructor->id,
-                                'room_id' => $room->id,
-                                'conflict_type' => 'SCHEDULED_SUCCESS',
-                                'severity' => 'info',
-                                'is_conflict' => false,
-                                'message' => "{$subject->subject_code} {$slotData['type']} scheduled on {$slotData['day']} {$slotData['start_time']} - {$slotData['end_time']} in room {$room->room_code}.",
-                            ]);
-
-                            $created[] = $schedule->load(['subject', 'instructor', 'room']);
-                        }
-
-                        $pairedPlaced = true;
-                        break;
                     }
 
                     if ($pairedPlaced) {
@@ -327,6 +386,11 @@ class AutoScheduleService
                                 : 'Could not place consecutive lecture/laboratory session.'
                         );
 
+                    $failed[] = [
+                        'subject' => $subject->subject_code,
+                        'reason' => $pairedReason,
+                    ];
+
                     ScheduleGenerationConflict::create([
                         'generation_run_id' => $generationRun->id,
                         'schedule_id' => null,
@@ -340,8 +404,12 @@ class AutoScheduleService
                         'is_conflict' => true,
                         'message' => "{$subject->subject_code} - {$pairedReason}",
                     ]);
-                }
 
+                    // Do not fall back to separated scheduling for lecture + laboratory subjects.
+                    // If the pair cannot be placed back-to-back, leave it as a conflict instead
+                    // of creating a lecture/lab interval like 7:00-10:00 and 10:30-12:30.
+                    continue;
+                }
                 foreach ($sessions as $session) {
                     $sessionHours = (float) $session['hours'];
                     $sessionType = $session['type'];
@@ -352,7 +420,21 @@ class AutoScheduleService
                     $timeFailureReasons = [];
                     $roomFailureReasons = [];
 
-                    foreach ($instructorCandidates as $facultySubject) {
+                    $sessionInstructorCandidates = $this->sortInstructorCandidatesByLoadBalance(
+                        $this->getInstructorCandidatesForSubjectCourse(
+                            (int) $subject->id,
+                            (int) $section->course_id,
+                            $sessionType
+                        ),
+                        $schoolYearId,
+                        $semesterId
+                    );
+
+                    if ($sessionInstructorCandidates->isEmpty()) {
+                        $timeFailureReasons[] = "No instructor assigned for {$sessionType} session.";
+                    }
+
+                    foreach ($sessionInstructorCandidates as $facultySubject) {
                         $instructor = $facultySubject->instructor;
 
                         $slot = $this->findBestSlot(
@@ -510,8 +592,8 @@ class AutoScheduleService
     protected function sortCurriculaByDifficulty($curricula, int $schoolYearId, int $semesterId)
     {
         return $curricula->sort(function ($a, $b) use ($schoolYearId, $semesterId) {
-            $scoreA = $this->calculateCurriculumDifficulty($a, $schoolYearId, $semesterId);
-            $scoreB = $this->calculateCurriculumDifficulty($b, $schoolYearId, $semesterId);
+            $scoreA = $this->calculateCurriculumDifficulty($a, $schoolYearId, $semesterId, (int) $a->course_id);
+            $scoreB = $this->calculateCurriculumDifficulty($b, $schoolYearId, $semesterId, (int) $b->course_id);
 
             if ($scoreA === $scoreB) {
                 return ($a->sort_order ?? 9999) <=> ($b->sort_order ?? 9999);
@@ -521,7 +603,7 @@ class AutoScheduleService
         })->values();
     }
 
-    protected function calculateCurriculumDifficulty($curriculum, int $schoolYearId, int $semesterId): int
+    protected function calculateCurriculumDifficulty($curriculum, int $schoolYearId, int $semesterId, ?int $courseId = null): int
     {
         $subject = $curriculum->subject;
 
@@ -538,8 +620,8 @@ class AutoScheduleService
         $hasLab = $laboratoryHours > 0;
         $hasLecture = $lectureHours > 0;
 
-        $instructorCandidates = FacultySubject::where('subject_id', $subject->id)->get();
-        $instructorCount = $instructorCandidates->count();
+        $courseId = $courseId ?? (int) ($curriculum->course_id ?? 0);
+        $instructorCount = $this->countInstructorCandidatesForSubjectCourse($subject->id, $courseId);
 
         $lectureRoomType = $subject->lecture_room_type_required ?? null;
         $labRoomType = $subject->laboratory_room_type_required ?? null;
@@ -547,6 +629,7 @@ class AutoScheduleService
 
         $availabilityWindows = $this->countInstructorAvailabilityWindows(
             $subject->id,
+            $courseId,
             $schoolYearId,
             $semesterId
         );
@@ -602,10 +685,11 @@ class AutoScheduleService
 
     protected function countInstructorAvailabilityWindows(
         int $subjectId,
+        int $courseId,
         int $schoolYearId,
         int $semesterId
     ): int {
-        $instructorIds = FacultySubject::where('subject_id', $subjectId)
+        $instructorIds = $this->getFacultySubjectBaseQuery($subjectId, $courseId)
             ->pluck('instructor_id')
             ->unique()
             ->values();
@@ -621,6 +705,53 @@ class AutoScheduleService
             ->count();
     }
 
+    protected function getFacultySubjectBaseQuery(int $subjectId, int $courseId)
+    {
+        return FacultySubject::query()
+            ->where('subject_id', $subjectId)
+            ->where('course_id', $courseId);
+    }
+
+    protected function getInstructorCandidatesForSubjectCourse(int $subjectId, int $courseId, ?string $sessionType = null)
+    {
+        return $this->getFacultySubjectBaseQuery($subjectId, $courseId)
+            ->with(['instructor', 'course'])
+            ->when($sessionType, function ($query) use ($sessionType) {
+                $query->where(function ($q) use ($sessionType) {
+                    $q->whereIn('session_type', [$sessionType, 'both'])
+                        ->orWhereNull('session_type');
+                });
+            })
+            ->whereHas('instructor', function ($query) {
+                $query->where(function ($q) {
+                    $q->whereNull('archived')
+                        ->orWhere('archived', 0);
+                })
+                ->where(function ($q) {
+                    $q->whereNull('status')
+                        ->orWhereIn('status', ['Active', 'active']);
+                });
+            })
+            ->orderByDesc('is_primary')
+            ->orderByDesc('priority_score')
+            ->get();
+    }
+
+    protected function countInstructorCandidatesForSubjectCourse(int $subjectId, int $courseId): int
+    {
+        return $this->getFacultySubjectBaseQuery($subjectId, $courseId)
+            ->whereHas('instructor', function ($query) {
+                $query->where(function ($q) {
+                    $q->whereNull('archived')
+                        ->orWhere('archived', 0);
+                })
+                ->where(function ($q) {
+                    $q->whereNull('status')
+                        ->orWhereIn('status', ['Active', 'active']);
+                });
+            })
+            ->count();
+    }
     protected function buildSessions($subject): array
     {
         $sessions = [];
@@ -916,7 +1047,8 @@ class AutoScheduleService
     protected function findConsecutiveLectureLabSlot(
         Section $section,
         $subject,
-        int $instructorId,
+        int $lectureInstructorId,
+        int $labInstructorId,
         int $schoolYearId,
         int $semesterId,
         array $sessions
@@ -954,7 +1086,7 @@ class AutoScheduleService
                 $lectureInvalidReason = $this->getCandidateSlotInvalidReason(
                     $section,
                     $subject,
-                    $instructorId,
+                    $lectureInstructorId,
                     $schoolYearId,
                     $semesterId,
                     $day,
@@ -971,7 +1103,7 @@ class AutoScheduleService
                 $labInvalidReason = $this->getCandidateSlotInvalidReason(
                     $section,
                     $subject,
-                    $instructorId,
+                    $labInstructorId,
                     $schoolYearId,
                     $semesterId,
                     $day,
@@ -1001,18 +1133,29 @@ class AutoScheduleService
                 }
 
                 if (!$this->respectsInstructorLoad(
-                    $instructorId,
-                    $totalHoursForDay,
+                    $lectureInstructorId,
+                    (float) $lecture['hours'],
                     $schoolYearId,
                     $semesterId
                 )) {
-                    $this->rememberSlotFailure('Instructor load limit blocks this lecture/laboratory pair.');
+                    $this->rememberSlotFailure('Lecture instructor load limit blocks this lecture/laboratory pair.');
+                    continue;
+                }
+
+                if (!$this->respectsInstructorLoad(
+                    $labInstructorId,
+                    (float) $lab['hours'],
+                    $schoolYearId,
+                    $semesterId
+                )) {
+                    $this->rememberSlotFailure('Laboratory instructor load limit blocks this lecture/laboratory pair.');
                     continue;
                 }
 
                 return [
                     [
                         'type' => 'lecture',
+                        'instructor_id' => $lectureInstructorId,
                         'hours' => (float) $lecture['hours'],
                         'day' => $day,
                         'start_time' => $lectureSlot['start_time'],
@@ -1020,6 +1163,7 @@ class AutoScheduleService
                     ],
                     [
                         'type' => 'laboratory',
+                        'instructor_id' => $labInstructorId,
                         'hours' => (float) $lab['hours'],
                         'day' => $day,
                         'start_time' => $labSlot['start_time'],
@@ -1842,7 +1986,7 @@ class AutoScheduleService
                 $specialRoomSubjects++;
             }
 
-            $instructorCount = FacultySubject::where('subject_id', $subject->id)->count();
+            $instructorCount = $this->countInstructorCandidatesForSubjectCourse($subject->id, $section->course_id);
 
             if ($instructorCount === 0) {
                 $subjectsWithNoInstructor++;
@@ -1853,7 +1997,8 @@ class AutoScheduleService
             $score += $this->calculateCurriculumDifficulty(
                 $curriculum,
                 $schoolYearId,
-                $semesterId
+                $semesterId,
+                $section->course_id
             );
         }
 
